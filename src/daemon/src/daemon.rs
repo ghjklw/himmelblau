@@ -47,7 +47,8 @@ use himmelblau_unix_common::resolver::{AuthSession, Resolver};
 use himmelblau_unix_common::unix_config::UidAttr;
 use himmelblau_unix_common::unix_passwd::{parse_etc_group, parse_etc_passwd};
 use himmelblau_unix_common::unix_proto::{
-    ClientRequest, ClientResponse, PamAuthResponse, TaskRequest, TaskResponse,
+    ClientRequest, ClientResponse, LearnedNameMappingOutcome, PamAuthResponse, TaskRequest,
+    TaskResponse,
 };
 use himmelblau_unix_common::user_map::UserMap;
 use himmelblau_unix_common::{tpm_init, tpm_loadable_machine_key, tpm_machine_key};
@@ -869,14 +870,18 @@ async fn handle_client(
                     .await
                 {
                     Ok(()) => match time::timeout(Duration::from_millis(1000), rx).await {
-                        Ok(Ok(TaskOutcome::Status(0))) => ClientResponse::Ok,
+                        Ok(Ok(TaskOutcome::Status(0))) => ClientResponse::PamLearnedNameMapping(
+                            LearnedNameMappingOutcome::Persisted,
+                        ),
                         Ok(Ok(TaskOutcome::Status(2))) => {
                             debug!(
                                 supplied_name,
                                 authenticated_upn,
                                 "Learned-name mapping skipped"
                             );
-                            ClientResponse::Ok
+                            ClientResponse::PamLearnedNameMapping(
+                                LearnedNameMappingOutcome::Skipped,
+                            )
                         }
                         other => {
                             error!(?other, "Failed to persist learned-name mapping");

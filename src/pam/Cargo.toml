@@ -23,6 +23,9 @@ himmelblau_unix_common.workspace = true
 tokio.workspace = true
 libhimmelblau.workspace = true
 
+[dev-dependencies]
+serde_json.workspace = true
+
 [build-dependencies]
 pkg-config.workspace = true
 

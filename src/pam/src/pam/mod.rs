@@ -71,7 +71,9 @@ use himmelblau_unix_common::i18n::{self, tr, tr_fmt};
 use himmelblau_unix_common::idprovider::openidconnect::{
     mfa_from_oidc_device, OidcApplication, OidcTokenResponseExt,
 };
-use himmelblau_unix_common::unix_proto::{ClientRequest, ClientResponse};
+use himmelblau_unix_common::unix_proto::{
+    ClientRequest, ClientResponse, LearnedNameMappingOutcome,
+};
 use himmelblau_unix_common::user_map::UserMap;
 use std::thread::sleep;
 
@@ -213,6 +215,36 @@ fn should_capture_keyring_secret(prompt: &str) -> bool {
 
 fn should_learn_short_name_after_auth(result: &PamResultCode, supplied_name: &str) -> bool {
     *result == PamResultCode::PAM_SUCCESS && split_username(supplied_name).is_some()
+}
+
+fn request_learned_name_mapping_after_auth(
+    result: &PamResultCode,
+    supplied_name: &str,
+    daemon_client: &mut DaemonClientBlocking,
+    timeout: u64,
+) -> Option<LearnedNameMappingOutcome> {
+    if !should_learn_short_name_after_auth(result, supplied_name) {
+        return None;
+    }
+
+    let req = ClientRequest::PamLearnedNameMapping(supplied_name.to_string());
+    match daemon_client.call_and_wait(&req, timeout) {
+        Ok(ClientResponse::PamLearnedNameMapping(outcome)) => {
+            match outcome {
+                LearnedNameMappingOutcome::Persisted => {
+                    debug!("Persisted learned short-name mapping for {}", supplied_name);
+                }
+                LearnedNameMappingOutcome::Skipped => {
+                    debug!("Skipped learned short-name mapping for {}", supplied_name);
+                }
+            }
+            Some(outcome)
+        }
+        other => {
+            error!(?other, "Failed to persist learned short-name mapping");
+            None
+        }
+    }
 }
 
 pub struct KeyringCaptureMessagePrinter {
@@ -488,17 +520,12 @@ impl PamHooks for PamKanidm {
 
         // Preserve the original PAM username and ask the same authenticated
         // daemon session to persist the alias through its privileged tasks service.
-        if should_learn_short_name_after_auth(&result, &supplied_account_id) {
-            let req = ClientRequest::PamLearnedNameMapping(supplied_account_id.clone());
-            match daemon_client.call_and_wait(&req, cfg.get_unix_sock_timeout()) {
-                Ok(ClientResponse::Ok) => {
-                    debug!("Learned short-name mapping handled by daemon");
-                }
-                other => {
-                    error!(?other, "Failed to persist learned short-name mapping");
-                }
-            }
-        }
+        let _ = request_learned_name_mapping_after_auth(
+            &result,
+            &supplied_account_id,
+            &mut daemon_client,
+            cfg.get_unix_sock_timeout(),
+        );
 
         if set_authtok && result == PamResultCode::PAM_SUCCESS {
             if let Ok(Some(secret)) = keyring_secret.lock().map(|s| s.clone()) {
@@ -1121,6 +1148,134 @@ impl PamHooks for PamKanidm {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use himmelblau_unix_common::unix_proto::PamAuthResponse;
+    use std::fs;
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct SilentPrinter;
+
+    impl MessagePrinter for SilentPrinter {
+        fn print_text(&self, _msg: &str) {}
+
+        fn print_error(&self, _msg: &str) {}
+
+        fn prompt_echo_on(&self, _prompt: &str) -> Option<String> {
+            None
+        }
+
+        fn prompt_echo_off(&self, _prompt: &str) -> Option<String> {
+            None
+        }
+    }
+
+    fn unique_test_path(suffix: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock must be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "himmelblau_pam_test_{}_{}_{}",
+            std::process::id(),
+            nonce,
+            suffix
+        ))
+    }
+
+    #[test]
+    fn successful_auth_delegates_learned_name_write_to_authenticated_daemon_session() {
+        let socket_path = unique_test_path("daemon.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind test daemon socket");
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept PAM client");
+            let mut buffer = [0_u8; 4096];
+
+            let count = stream.read(&mut buffer).expect("read auth request");
+            let request: ClientRequest =
+                serde_json::from_slice(&buffer[..count]).expect("decode auth request");
+            match request {
+                ClientRequest::PamAuthenticateInit(account_id, _, _, _) => {
+                    assert_eq!(account_id, "alice@company.com");
+                }
+                other => panic!("unexpected first request: {}", other.as_safe_string()),
+            }
+
+            let response =
+                ClientResponse::PamAuthenticateStepResponse(PamAuthResponse::Success);
+            stream
+                .write_all(&serde_json::to_vec(&response).expect("encode auth response"))
+                .expect("write auth response");
+            stream.flush().expect("flush auth response");
+
+            let count = stream
+                .read(&mut buffer)
+                .expect("read learned-name mapping request");
+            let request: ClientRequest =
+                serde_json::from_slice(&buffer[..count]).expect("decode learned-name request");
+            match request {
+                ClientRequest::PamLearnedNameMapping(account_id) => {
+                    assert_eq!(account_id, "alice@company.com");
+                }
+                other => panic!("unexpected second request: {}", other.as_safe_string()),
+            }
+
+            let response = ClientResponse::PamLearnedNameMapping(
+                LearnedNameMappingOutcome::Persisted,
+            );
+            stream
+                .write_all(&serde_json::to_vec(&response).expect("encode learned-name response"))
+                .expect("write learned-name response");
+            stream.flush().expect("flush learned-name response");
+        });
+
+        let config_path = unique_test_path("himmelblau.conf");
+        fs::write(&config_path, "[global]\nconnection_timeout = 1\n")
+            .expect("write test config");
+        let cfg = HimmelblauConfig::new(Some(
+            config_path
+                .to_str()
+                .expect("test config path must be valid UTF-8"),
+        ))
+        .expect("load test config");
+        let timeout = cfg.get_unix_sock_timeout();
+
+        let daemon_client = DaemonClientBlocking::new(
+            socket_path
+                .to_str()
+                .expect("test socket path must be valid UTF-8"),
+        )
+        .expect("connect to test daemon");
+
+        let (result, mut daemon_client) = authenticate_with_client(
+            daemon_client,
+            None,
+            cfg,
+            "alice@company.com",
+            "login",
+            Options::default(),
+            Arc::new(SilentPrinter),
+        );
+        assert_eq!(result, PamResultCode::PAM_SUCCESS);
+
+        // Regression for non-root PAM callers: the PAM side only asks the
+        // authenticated daemon session to perform the privileged cache write.
+        assert_eq!(
+            request_learned_name_mapping_after_auth(
+                &result,
+                "alice@company.com",
+                &mut daemon_client,
+                timeout,
+            ),
+            Some(LearnedNameMappingOutcome::Persisted)
+        );
+
+        server.join().expect("test daemon thread must succeed");
+        let _ = fs::remove_file(socket_path);
+        let _ = fs::remove_file(config_path);
+    }
 
     #[test]
     fn failed_authentication_never_triggers_short_name_learning() {

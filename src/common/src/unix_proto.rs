@@ -232,6 +232,12 @@ impl ClientRequest {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LearnedNameMappingOutcome {
+    Persisted,
+    Skipped,
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub enum ClientResponse {
     NssAccounts(Vec<NssUser>),
@@ -242,6 +248,7 @@ pub enum ClientResponse {
 
     PamStatus(Option<bool>),
     PamAuthenticateStepResponse(PamAuthResponse),
+    PamLearnedNameMapping(LearnedNameMappingOutcome),
 
     Ok,
     Error,
