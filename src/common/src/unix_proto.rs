@@ -178,9 +178,8 @@ pub enum ClientRequest {
     NssGroupByGid(u32),
     NssGroupByName(String),
     NssInitgroups(String),
-    PamAuthenticateInit(String, String, bool, bool),
+    PamAuthenticateInit(String, String, bool, bool, Option<String>),
     PamAuthenticateStep(PamAuthRequest),
-    PamLearnedNameMapping(String),
     PamAccountAllowed(String),
     PamAccountBeginSession(String),
     PamChangeAuthToken(String, String, String, String),
@@ -203,16 +202,13 @@ impl ClientRequest {
             ClientRequest::NssGroupByGid(id) => format!("NssGroupByGid({})", id),
             ClientRequest::NssGroupByName(id) => format!("NssGroupByName({})", id),
             ClientRequest::NssInitgroups(id) => format!("NssInitgroups({})", id),
-            ClientRequest::PamAuthenticateInit(id, service, no_hello_pin, force_reauth) => {
+            ClientRequest::PamAuthenticateInit(id, service, no_hello_pin, force_reauth, _) => {
                 format!(
                     "PamAuthenticateInit({}, {}, no_hello_pin: {}, force_reauth: {})",
                     id, service, no_hello_pin, force_reauth
                 )
             }
             ClientRequest::PamAuthenticateStep(_) => "PamAuthenticateStep".to_string(),
-            ClientRequest::PamLearnedNameMapping(id) => {
-                format!("PamLearnedNameMapping({})", id)
-            }
             ClientRequest::PamAccountAllowed(id) => {
                 format!("PamAccountAllowed({})", id)
             }
@@ -232,12 +228,6 @@ impl ClientRequest {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LearnedNameMappingOutcome {
-    Persisted,
-    Skipped,
-}
-
 #[derive(Serialize, Deserialize, Debug)]
 pub enum ClientResponse {
     NssAccounts(Vec<NssUser>),
@@ -248,7 +238,6 @@ pub enum ClientResponse {
 
     PamStatus(Option<bool>),
     PamAuthenticateStepResponse(PamAuthResponse),
-    PamLearnedNameMapping(LearnedNameMappingOutcome),
 
     Ok,
     Error,

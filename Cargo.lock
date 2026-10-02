@@ -3970,7 +3970,6 @@ dependencies = [
  "libc",
  "libhimmelblau",
  "pkg-config",
- "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

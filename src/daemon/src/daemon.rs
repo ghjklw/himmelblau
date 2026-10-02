@@ -47,8 +47,7 @@ use himmelblau_unix_common::resolver::{AuthSession, Resolver};
 use himmelblau_unix_common::unix_config::UidAttr;
 use himmelblau_unix_common::unix_passwd::{parse_etc_group, parse_etc_passwd};
 use himmelblau_unix_common::unix_proto::{
-    ClientRequest, ClientResponse, LearnedNameMappingOutcome, PamAuthResponse, TaskRequest,
-    TaskResponse,
+    ClientRequest, ClientResponse, PamAuthResponse, TaskRequest, TaskResponse,
 };
 use himmelblau_unix_common::user_map::UserMap;
 use himmelblau_unix_common::{tpm_init, tpm_loadable_machine_key, tpm_machine_key};
@@ -408,6 +407,15 @@ async fn reconcile_local_groups_periodically(
     info!("Stopped local group reconciler");
 }
 
+fn is_verified_full_upn_login(supplied_name: Option<&str>, authenticated_upn: &str) -> bool {
+    match supplied_name {
+        Some(name) => {
+            split_username(name).is_some() && name.eq_ignore_ascii_case(authenticated_upn)
+        }
+        None => false,
+    }
+}
+
 async fn handle_client(
     sock: UnixStream,
     cachelayer: Arc<Resolver<HimmelblauMultiProvider>>,
@@ -425,6 +433,7 @@ async fn handle_client(
 
     let mut reqs = Framed::new(sock, ClientCodec);
     let mut pam_auth_session_state = None;
+    let mut pam_supplied_account_id = None;
 
     // Setup a broadcast channel so that if we have an unexpected disconnection, we can
     // tell consumers to stop work.
@@ -512,8 +521,15 @@ async fn handle_client(
                         ClientResponse::Error
                     })
             }
-            ClientRequest::PamAuthenticateInit(account_id, service, no_hello_pin, force_reauth) => {
+            ClientRequest::PamAuthenticateInit(
+                account_id,
+                service,
+                no_hello_pin,
+                force_reauth,
+                supplied_account_id,
+            ) => {
                 let account_id = account_id.to_lowercase();
+                pam_supplied_account_id = supplied_account_id;
                 let span = span!(Level::INFO, "pam authenticate init");
                 trace!("pam authenticate init");
 
@@ -819,6 +835,74 @@ async fn handle_client(
                                                         .await;
                                                     }
 
+                                                    // Bind learning to the original PAM input and
+                                                    // the authenticated daemon session. The tasks
+                                                    // service performs the privileged cache write.
+                                                    if matches!(&resp, PamAuthResponse::Success) {
+                                                        if let Some(supplied_name) =
+                                                            pam_supplied_account_id.as_deref()
+                                                        {
+                                                            if is_verified_full_upn_login(
+                                                                Some(supplied_name),
+                                                                &account_id,
+                                                            ) {
+                                                                let (tx, rx) = oneshot::channel();
+                                                                match task_channel_tx
+                                                                    .send_timeout(
+                                                                        (
+                                                                            TaskRequest::LearnedNameMapping(
+                                                                                supplied_name
+                                                                                    .to_string(),
+                                                                                account_id.clone(),
+                                                                            ),
+                                                                            tx,
+                                                                        ),
+                                                                        Duration::from_millis(100),
+                                                                    )
+                                                                    .await
+                                                                {
+                                                                    Ok(()) => match time::timeout(
+                                                                        Duration::from_millis(1000),
+                                                                        rx,
+                                                                    )
+                                                                    .await
+                                                                    {
+                                                                        Ok(Ok(TaskOutcome::Status(0))) => {
+                                                                            debug!(
+                                                                                supplied_name,
+                                                                                authenticated_upn = %account_id,
+                                                                                "Persisted learned-name mapping"
+                                                                            );
+                                                                        }
+                                                                        Ok(Ok(TaskOutcome::Status(2))) => {
+                                                                            debug!(
+                                                                                supplied_name,
+                                                                                authenticated_upn = %account_id,
+                                                                                "Learned-name mapping skipped"
+                                                                            );
+                                                                        }
+                                                                        other => {
+                                                                            error!(
+                                                                                ?other,
+                                                                                supplied_name,
+                                                                                authenticated_upn = %account_id,
+                                                                                "Failed to persist learned-name mapping"
+                                                                            );
+                                                                        }
+                                                                    },
+                                                                    Err(e) => {
+                                                                        error!(
+                                                                            ?e,
+                                                                            supplied_name,
+                                                                            authenticated_upn = %account_id,
+                                                                            "Failed to queue learned-name mapping"
+                                                                        );
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+
                                                     ClientResponse::PamAuthenticateStepResponse(resp)
                                                 }
                                                 _ => ClientResponse::PamAuthenticateStepResponse(resp),
@@ -838,61 +922,6 @@ async fn handle_client(
                 }
                 .instrument(span)
                 .await
-            }
-            ClientRequest::PamLearnedNameMapping(supplied_name) => {
-                let authenticated_upn = match &pam_auth_session_state {
-                    Some(AuthSession::Success(account_id))
-                        if supplied_name.eq_ignore_ascii_case(account_id) =>
-                    {
-                        account_id.clone()
-                    }
-                    _ => {
-                        warn!(
-                            "Rejecting learned-name mapping without a matching successful PAM session"
-                        );
-                        reqs.send(ClientResponse::NotAuthenticated).await?;
-                        continue;
-                    }
-                };
-
-                let (tx, rx) = oneshot::channel();
-                match task_channel_tx
-                    .send_timeout(
-                        (
-                            TaskRequest::LearnedNameMapping(
-                                supplied_name.clone(),
-                                authenticated_upn.clone(),
-                            ),
-                            tx,
-                        ),
-                        Duration::from_millis(100),
-                    )
-                    .await
-                {
-                    Ok(()) => match time::timeout(Duration::from_millis(1000), rx).await {
-                        Ok(Ok(TaskOutcome::Status(0))) => ClientResponse::PamLearnedNameMapping(
-                            LearnedNameMappingOutcome::Persisted,
-                        ),
-                        Ok(Ok(TaskOutcome::Status(2))) => {
-                            debug!(
-                                supplied_name,
-                                authenticated_upn,
-                                "Learned-name mapping skipped"
-                            );
-                            ClientResponse::PamLearnedNameMapping(
-                                LearnedNameMappingOutcome::Skipped,
-                            )
-                        }
-                        other => {
-                            error!(?other, "Failed to persist learned-name mapping");
-                            ClientResponse::Error
-                        }
-                    },
-                    Err(e) => {
-                        error!(?e, "Failed to queue learned-name mapping");
-                        ClientResponse::Error
-                    }
-                }
             }
             ClientRequest::PamAccountAllowed(account_id) => {
                 let account_id = account_id.to_lowercase();
@@ -2460,4 +2489,26 @@ async fn main() -> ExitCode {
     })
     .await
     // TODO: can we catch signals to clean up sockets etc, especially handy when running as root
+}
+
+#[cfg(test)]
+mod learned_name_mapping_tests {
+    use super::is_verified_full_upn_login;
+
+    #[test]
+    fn learned_name_mapping_requires_explicit_authenticated_full_upn() {
+        assert!(is_verified_full_upn_login(
+            Some("Alice@company.com"),
+            "alice@company.com"
+        ));
+        assert!(!is_verified_full_upn_login(
+            Some("alice"),
+            "alice@company.com"
+        ));
+        assert!(!is_verified_full_upn_login(
+            Some("bob@company.com"),
+            "alice@company.com"
+        ));
+        assert!(!is_verified_full_upn_login(None, "alice@company.com"));
+    }
 }
