@@ -659,6 +659,38 @@ async fn handle_tasks(stream: UnixStream, cfg: &HimmelblauConfig) {
                     return;
                 }
             }
+            Some(Ok(TaskRequest::LearnedNameMapping(
+                supplied_name,
+                authenticated_upn,
+            ))) => {
+                debug!("Received task -> LearnedNameMapping(...)");
+                let response = match cfg
+                    .learn_authenticated_short_name(&supplied_name, &authenticated_upn)
+                {
+                    Ok(true) => TaskResponse::Success(0),
+                    Ok(false) => {
+                        debug!(
+                            supplied_name,
+                            authenticated_upn,
+                            "Learned-name mapping skipped"
+                        );
+                        TaskResponse::Success(2)
+                    }
+                    Err(e) => {
+                        error!(
+                            supplied_name,
+                            authenticated_upn,
+                            error = %e,
+                            "Failed to persist learned-name mapping"
+                        );
+                        TaskResponse::Error(e.to_string())
+                    }
+                };
+                if let Err(e) = reqs.send(response).await {
+                    error!("Error -> {:?}", e);
+                    return;
+                }
+            }
             Some(Ok(TaskRequest::LogonScript(account_id, access_token))) => {
                 debug!("Received task -> LogonScript(...)");
                 let mut status = 0;

@@ -1487,7 +1487,7 @@ pub fn authenticate_with_client(
     service: &str,
     opts: Options,
     msg_printer: Arc<dyn MessagePrinter>,
-) -> PamResultCode {
+) -> (PamResultCode, DaemonClientBlocking) {
     i18n::init();
     let mut state = AuthenticateState {
         daemon_client,
@@ -1513,7 +1513,9 @@ pub fn authenticate_with_client(
         let res = authenticate_request_response(&mut state, &req);
         match res {
             PamWhatNext::Next(next_request) => req = next_request,
-            PamWhatNext::Finish(pam_result_code) => return pam_result_code,
+            PamWhatNext::Finish(pam_result_code) => {
+                return (pam_result_code, state.daemon_client)
+            }
         }
     }
 }
@@ -1541,6 +1543,7 @@ pub fn authenticate(
         opts,
         msg_printer,
     )
+    .0
 }
 
 pub async fn authenticate_async(

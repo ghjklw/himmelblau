@@ -180,6 +180,7 @@ pub enum ClientRequest {
     NssInitgroups(String),
     PamAuthenticateInit(String, String, bool, bool),
     PamAuthenticateStep(PamAuthRequest),
+    PamLearnedNameMapping(String),
     PamAccountAllowed(String),
     PamAccountBeginSession(String),
     PamChangeAuthToken(String, String, String, String),
@@ -209,6 +210,9 @@ impl ClientRequest {
                 )
             }
             ClientRequest::PamAuthenticateStep(_) => "PamAuthenticateStep".to_string(),
+            ClientRequest::PamLearnedNameMapping(id) => {
+                format!("PamLearnedNameMapping({})", id)
+            }
             ClientRequest::PamAccountAllowed(id) => {
                 format!("PamAccountAllowed({})", id)
             }
@@ -264,6 +268,7 @@ pub struct HomeDirectoryInfo {
 pub enum TaskRequest {
     HomeDirectory(HomeDirectoryInfo),
     LocalGroups(String, bool),
+    LearnedNameMapping(String, String),
     LogonScript(String, String),
     KerberosConfig(Option<String>, Option<String>),
     KerberosTGTs(
@@ -285,6 +290,7 @@ impl TaskRequest {
         match self {
             TaskRequest::HomeDirectory(_) => "HomeDirectory(...)".to_string(),
             TaskRequest::LocalGroups(_, _) => "LocalGroups(...)".to_string(),
+            TaskRequest::LearnedNameMapping(_, _) => "LearnedNameMapping(...)".to_string(),
             TaskRequest::LogonScript(_, _) => "LogonScript(...)".to_string(),
             TaskRequest::KerberosConfig(..) => "KerberosConfig(...)".to_string(),
             TaskRequest::KerberosTGTs(uid, gid, _, _) => {

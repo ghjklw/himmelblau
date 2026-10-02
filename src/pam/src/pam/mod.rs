@@ -476,7 +476,7 @@ impl PamHooks for PamKanidm {
             base_printer
         };
 
-        let result = authenticate_with_client(
+        let (result, mut daemon_client) = authenticate_with_client(
             daemon_client,
             authtok,
             cfg.clone(),
@@ -486,10 +486,18 @@ impl PamHooks for PamKanidm {
             msg_printer,
         );
 
-        // Preserve the original PAM username and only learn after a successful
-        // authentication of an explicitly supplied full UPN.
+        // Preserve the original PAM username and ask the same authenticated
+        // daemon session to persist the alias through its privileged tasks service.
         if should_learn_short_name_after_auth(&result, &supplied_account_id) {
-            cfg.learn_authenticated_short_name(&supplied_account_id, &account_id);
+            let req = ClientRequest::PamLearnedNameMapping(supplied_account_id.clone());
+            match daemon_client.call_and_wait(&req, cfg.get_unix_sock_timeout()) {
+                Ok(ClientResponse::Ok) => {
+                    debug!("Learned short-name mapping handled by daemon");
+                }
+                other => {
+                    error!(?other, "Failed to persist learned short-name mapping");
+                }
+            }
         }
 
         if set_authtok && result == PamResultCode::PAM_SUCCESS {

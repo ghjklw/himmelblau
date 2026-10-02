@@ -838,6 +838,57 @@ async fn handle_client(
                 .instrument(span)
                 .await
             }
+            ClientRequest::PamLearnedNameMapping(supplied_name) => {
+                let authenticated_upn = match &pam_auth_session_state {
+                    Some(AuthSession::Success(account_id))
+                        if supplied_name.eq_ignore_ascii_case(account_id) =>
+                    {
+                        account_id.clone()
+                    }
+                    _ => {
+                        warn!(
+                            "Rejecting learned-name mapping without a matching successful PAM session"
+                        );
+                        reqs.send(ClientResponse::NotAuthenticated).await?;
+                        continue;
+                    }
+                };
+
+                let (tx, rx) = oneshot::channel();
+                match task_channel_tx
+                    .send_timeout(
+                        (
+                            TaskRequest::LearnedNameMapping(
+                                supplied_name.clone(),
+                                authenticated_upn.clone(),
+                            ),
+                            tx,
+                        ),
+                        Duration::from_millis(100),
+                    )
+                    .await
+                {
+                    Ok(()) => match time::timeout(Duration::from_millis(1000), rx).await {
+                        Ok(Ok(TaskOutcome::Status(0))) => ClientResponse::Ok,
+                        Ok(Ok(TaskOutcome::Status(2))) => {
+                            debug!(
+                                supplied_name,
+                                authenticated_upn,
+                                "Learned-name mapping skipped"
+                            );
+                            ClientResponse::Ok
+                        }
+                        other => {
+                            error!(?other, "Failed to persist learned-name mapping");
+                            ClientResponse::Error
+                        }
+                    },
+                    Err(e) => {
+                        error!(?e, "Failed to queue learned-name mapping");
+                        ClientResponse::Error
+                    }
+                }
+            }
             ClientRequest::PamAccountAllowed(account_id) => {
                 let account_id = account_id.to_lowercase();
                 trace!("pam account allowed");
