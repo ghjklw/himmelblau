@@ -824,6 +824,7 @@ fn handle_pam_auth_response_denied(state: &AuthenticateState, msg: &str) -> PamW
         state.service.to_string(),
         state.opts.no_hello_pin,
         state.opts.force_reauth,
+        state.supplied_account_id.clone(),
     );
     PamWhatNext::Next(req)
 }
@@ -1392,6 +1393,7 @@ struct AuthenticateState {
     authtok: Option<String>,
     cfg: HimmelblauConfig,
     account_id: String,
+    supplied_account_id: Option<String>,
     service: String,
     opts: Options,
     msg_printer: Arc<dyn MessagePrinter>,
@@ -1484,6 +1486,7 @@ pub fn authenticate_with_client(
     authtok: Option<String>,
     cfg: HimmelblauConfig,
     account_id: &str,
+    supplied_account_id: Option<&str>,
     service: &str,
     opts: Options,
     msg_printer: Arc<dyn MessagePrinter>,
@@ -1494,6 +1497,7 @@ pub fn authenticate_with_client(
         authtok,
         cfg,
         account_id: account_id.to_owned(),
+        supplied_account_id: supplied_account_id.map(str::to_owned),
         service: service.to_owned(),
         opts,
         msg_printer,
@@ -1507,6 +1511,7 @@ pub fn authenticate_with_client(
         state.service.to_owned(),
         state.opts.no_hello_pin,
         state.opts.force_reauth,
+        state.supplied_account_id.clone(),
     );
 
     loop {
@@ -1537,6 +1542,7 @@ pub fn authenticate(
         authtok,
         cfg,
         account_id,
+        None,
         service,
         opts,
         msg_printer,
@@ -1924,6 +1930,7 @@ mod tests {
                 authtok: None,
                 cfg: test_config(""),
                 account_id: "user@example.com".to_string(),
+                supplied_account_id: None,
                 service: "mariadb".to_string(),
                 opts: Options::default(),
                 msg_printer: printer,
