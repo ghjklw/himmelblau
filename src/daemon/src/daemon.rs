@@ -308,6 +308,31 @@ async fn submit_local_groups_task(
     }
 }
 
+async fn submit_learned_name_mapping_task(
+    task_channel_tx: &Sender<AsyncTaskRequest>,
+    supplied_name: String,
+    authenticated_upn: String,
+) -> Result<bool, ()> {
+    let (tx, rx) = oneshot::channel();
+
+    task_channel_tx
+        .send_timeout(
+            (
+                TaskRequest::LearnedNameMapping(supplied_name, authenticated_upn),
+                tx,
+            ),
+            Duration::from_millis(100),
+        )
+        .await
+        .map_err(|_| ())?;
+
+    match time::timeout(Duration::from_millis(1000), rx).await {
+        Ok(Ok(TaskOutcome::Status(0))) => Ok(true),
+        Ok(Ok(TaskOutcome::Status(2))) => Ok(false),
+        _ => Err(()),
+    }
+}
+
 async fn reconcile_local_groups_once(
     cachelayer: &Resolver<HimmelblauMultiProvider>,
     task_channel_tx: &Sender<AsyncTaskRequest>,
@@ -846,58 +871,28 @@ async fn handle_client(
                                                                 Some(supplied_name),
                                                                 &account_id,
                                                             ) {
-                                                                let (tx, rx) = oneshot::channel();
-                                                                match task_channel_tx
-                                                                    .send_timeout(
-                                                                        (
-                                                                            TaskRequest::LearnedNameMapping(
-                                                                                supplied_name
-                                                                                    .to_string(),
-                                                                                account_id.clone(),
-                                                                            ),
-                                                                            tx,
-                                                                        ),
-                                                                        Duration::from_millis(100),
-                                                                    )
-                                                                    .await
+                                                                match submit_learned_name_mapping_task(
+                                                                    task_channel_tx,
+                                                                    supplied_name.to_string(),
+                                                                    account_id.clone(),
+                                                                )
+                                                                .await
                                                                 {
-                                                                    Ok(()) => match time::timeout(
-                                                                        Duration::from_millis(1000),
-                                                                        rx,
-                                                                    )
-                                                                    .await
-                                                                    {
-                                                                        Ok(Ok(TaskOutcome::Status(0))) => {
-                                                                            debug!(
-                                                                                supplied_name,
-                                                                                authenticated_upn = %account_id,
-                                                                                "Persisted learned-name mapping"
-                                                                            );
-                                                                        }
-                                                                        Ok(Ok(TaskOutcome::Status(2))) => {
-                                                                            debug!(
-                                                                                supplied_name,
-                                                                                authenticated_upn = %account_id,
-                                                                                "Learned-name mapping skipped"
-                                                                            );
-                                                                        }
-                                                                        other => {
-                                                                            error!(
-                                                                                ?other,
-                                                                                supplied_name,
-                                                                                authenticated_upn = %account_id,
-                                                                                "Failed to persist learned-name mapping"
-                                                                            );
-                                                                        }
-                                                                    },
-                                                                    Err(e) => {
-                                                                        error!(
-                                                                            ?e,
-                                                                            supplied_name,
-                                                                            authenticated_upn = %account_id,
-                                                                            "Failed to queue learned-name mapping"
-                                                                        );
-                                                                    }
+                                                                    Ok(true) => debug!(
+                                                                        supplied_name,
+                                                                        authenticated_upn = %account_id,
+                                                                        "Persisted learned-name mapping"
+                                                                    ),
+                                                                    Ok(false) => debug!(
+                                                                        supplied_name,
+                                                                        authenticated_upn = %account_id,
+                                                                        "Learned-name mapping skipped"
+                                                                    ),
+                                                                    Err(()) => error!(
+                                                                        supplied_name,
+                                                                        authenticated_upn = %account_id,
+                                                                        "Failed to persist learned-name mapping"
+                                                                    ),
                                                                 }
                                                             }
                                                         }
@@ -2493,7 +2488,10 @@ async fn main() -> ExitCode {
 
 #[cfg(test)]
 mod learned_name_mapping_tests {
-    use super::is_verified_full_upn_login;
+    use super::{
+        channel, is_verified_full_upn_login, submit_learned_name_mapping_task, TaskOutcome,
+        TaskRequest,
+    };
 
     #[test]
     fn learned_name_mapping_requires_explicit_authenticated_full_upn() {
@@ -2510,5 +2508,36 @@ mod learned_name_mapping_tests {
             "alice@company.com"
         ));
         assert!(!is_verified_full_upn_login(None, "alice@company.com"));
+    }
+
+    #[tokio::test]
+    async fn learned_name_mapping_is_dispatched_to_privileged_task_channel() {
+        let (task_tx, mut task_rx) = channel(1);
+
+        let task = async {
+            let Some((request, response_tx)) = task_rx.recv().await else {
+                return false;
+            };
+
+            let valid_request = match request {
+                TaskRequest::LearnedNameMapping(supplied_name, authenticated_upn) => {
+                    supplied_name == "alice@company.com"
+                        && authenticated_upn == "alice@company.com"
+                }
+                _ => false,
+            };
+            let _ = response_tx.send(TaskOutcome::Status(0));
+            valid_request
+        };
+
+        let submit = submit_learned_name_mapping_task(
+            &task_tx,
+            "alice@company.com".to_string(),
+            "alice@company.com".to_string(),
+        );
+        let (result, valid_request) = tokio::join!(submit, task);
+
+        assert!(valid_request);
+        assert_eq!(result, Ok(true));
     }
 }
