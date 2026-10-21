@@ -10,6 +10,7 @@
 
 use std::convert::TryFrom;
 use std::fmt;
+use std::path::Path;
 use std::time::Duration;
 
 use crate::idprovider::interface::{GroupToken, Id, UserToken};
@@ -18,7 +19,7 @@ use kanidm_lib_crypto::CryptoPolicy;
 use kanidm_lib_crypto::DbPasswordV1;
 use kanidm_lib_crypto::Password;
 use libc::umask;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use tokio::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
 
@@ -31,6 +32,8 @@ use kanidm_hsm_crypto::{
 };
 
 const DBV_MAIN: &str = "main";
+// A blocked lookup holds the daemon's only runtime thread, so give up quickly.
+const READ_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[async_trait]
 pub trait Cache {
@@ -88,10 +91,13 @@ pub trait CacheTxn {
     fn get_account(&mut self, account_id: &Id) -> Result<Option<(UserToken, u64)>, CacheError>;
 
     fn get_accounts(&mut self) -> Result<Vec<UserToken>, CacheError>;
+    fn get_unexpired_accounts(&mut self, now: u64) -> Result<Vec<UserToken>, CacheError>;
 
     fn update_account(&mut self, account: &UserToken, expire: u64) -> Result<(), CacheError>;
 
     fn delete_account(&mut self, a_uuid: Uuid) -> Result<(), CacheError>;
+
+    fn clear_account_password(&mut self, a_uuid: Uuid) -> Result<(), CacheError>;
 
     fn update_account_password(
         &mut self,
@@ -134,6 +140,8 @@ pub trait KeyStoreTxn {
 
 pub struct Db {
     conn: Mutex<Connection>,
+    // Lookups read committed data here rather than wait for a write transaction.
+    read_conn: Option<Mutex<Connection>>,
     crypto_policy: CryptoPolicy,
 }
 
@@ -141,6 +149,10 @@ pub struct DbTxn<'a> {
     conn: MutexGuard<'a, Connection>,
     committed: bool,
     crypto_policy: &'a CryptoPolicy,
+}
+
+pub struct DbReadTxn<'a> {
+    txn: DbTxn<'a>,
 }
 
 #[derive(Debug)]
@@ -151,6 +163,20 @@ pub enum DbError {
 }
 
 impl Db {
+    fn from_connection(conn: Connection, read_conn: Option<Connection>) -> Self {
+        // We only build a single thread. If we need more than one, we'll
+        // need to re-do this to account for path = "" for debug.
+        let crypto_policy = CryptoPolicy::time_target(Duration::from_millis(250));
+
+        trace!("Configured {:?}", crypto_policy);
+
+        Db {
+            conn: Mutex::new(conn),
+            read_conn: read_conn.map(Mutex::new),
+            crypto_policy,
+        }
+    }
+
     pub fn new(path: &str) -> Result<Self, DbError> {
         let before = unsafe { umask(0o0077) };
         let conn = Connection::open(path).map_err(|e| {
@@ -158,16 +184,75 @@ impl Db {
             DbError::Sqlite
         })?;
         let _ = unsafe { umask(before) };
-        // We only build a single thread. If we need more than one, we'll
-        // need to re-do this to account for path = "" for debug.
-        let crypto_policy = CryptoPolicy::time_target(Duration::from_millis(250));
+        // Without spilling, the writer locks readers out only while it commits.
+        if let Err(e) = conn.pragma_update(None, "cache_spill", false) {
+            warn!(err = ?e, "Unable to disable the cache spill");
+        }
+        let read_conn = Self::open_reader(&conn);
+        Ok(Self::from_connection(conn, read_conn))
+    }
 
-        trace!("Configured {:?}", crypto_policy);
+    fn open_reader(conn: &Connection) -> Option<Connection> {
+        let path = conn.path().filter(|path| !path.is_empty())?;
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let read_conn = Connection::open_with_flags(path, flags).and_then(|read_conn| {
+            read_conn.busy_timeout(READ_BUSY_TIMEOUT)?;
+            Ok(read_conn)
+        });
+        match read_conn {
+            Ok(read_conn) => Some(read_conn),
+            Err(e) => {
+                warn!(err = ?e, "Unable to open a read connection, lookups will share the writer");
+                None
+            }
+        }
+    }
 
-        Ok(Db {
-            conn: Mutex::new(conn),
-            crypto_policy,
-        })
+    pub fn open_read_only(path: &str) -> Result<Option<Self>, DbError> {
+        match Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+            Ok(conn) => Ok(Some(Self::from_connection(conn, None))),
+            Err(e) => match Path::new(path).try_exists() {
+                Ok(false) => Ok(None),
+                _ => {
+                    error!(err = ?e, "rusqulite error");
+                    Err(DbError::Sqlite)
+                }
+            },
+        }
+    }
+
+    pub async fn get_loadable_hsm_key(&self) -> Result<Option<LoadableMachineKey>, CacheError> {
+        let mut dbtxn = self.write().await;
+        let initialized = dbtxn
+            .conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'table' AND name = 'db_version_t'
+                )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|e| dbtxn.sqlite_error("check database initialization", &e))?;
+        let loadable_machine_key = if initialized {
+            dbtxn.get_hsm_machine_key()?
+        } else {
+            None
+        };
+        dbtxn.commit()?;
+        Ok(loadable_machine_key)
+    }
+
+    /// Start a read-only transaction. Finish it before the next await, since
+    /// the writer cannot commit while it is open.
+    pub async fn read(&self) -> DbReadTxn<'_> {
+        let conn = match &self.read_conn {
+            Some(read_conn) => read_conn.lock().await,
+            None => self.conn.lock().await,
+        };
+        DbReadTxn {
+            txn: DbTxn::new(conn, &self.crypto_policy),
+        }
     }
 }
 
@@ -499,7 +584,17 @@ impl<'a> CacheTxn for DbTxn<'a> {
             self.clear_hsm()?;
         }
 
-        self.set_db_version(DBV_MAIN, 1)?;
+        if db_version < 2 {
+            // Older versions cached fabricated lookup identities with a fresh
+            // expiry, indistinguishable from authenticated accounts. Require a
+            // trusted refresh before any of those rows can be reconciled into
+            // local groups, but preserve identities and offline credentials.
+            self.conn
+                .execute("UPDATE account_t SET expiry = 0", [])
+                .map_err(|e| self.sqlite_error("invalidate legacy accounts", &e))?;
+        }
+
+        self.set_db_version(DBV_MAIN, 2)?;
 
         Ok(())
     }
@@ -587,14 +682,13 @@ impl<'a> CacheTxn for DbTxn<'a> {
             .optional()
             .map_err(|e| self.sqlite_error("query_row", &e))?;
 
-        match data {
-            Some(d) => Ok(serde_json::from_slice(d.as_slice())
-                .map_err(|e| {
-                    error!("json error -> {:?}", e);
-                })
-                .ok()),
-            None => Ok(None),
-        }
+        data.map(|d| {
+            serde_json::from_slice(d.as_slice()).map_err(|e| {
+                error!("json error -> {:?}", e);
+                CacheError::SerdeJson
+            })
+        })
+        .transpose()
     }
 
     fn insert_hsm_machine_key(
@@ -726,6 +820,24 @@ impl<'a> CacheTxn for DbTxn<'a> {
             .collect())
     }
 
+    fn get_unexpired_accounts(&mut self, now: u64) -> Result<Vec<UserToken>, CacheError> {
+        let now = i64::try_from(now).map_err(|_| CacheError::Parse)?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT token FROM account_t WHERE expiry > ?1")
+            .map_err(|e| self.sqlite_error("select prepare", &e))?;
+        let rows = stmt
+            .query_map([now], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(|e| self.sqlite_error("query_map", &e))?;
+        let data: Result<Vec<_>, _> = rows
+            .map(|row| row.map_err(|e| self.sqlite_error("map", &e)))
+            .collect();
+        Ok(data?
+            .into_iter()
+            .filter_map(|token| serde_json::from_slice(&token).ok())
+            .collect())
+    }
+
     fn update_account(&mut self, account: &UserToken, expire: u64) -> Result<(), CacheError> {
         let data = serde_json::to_vec(account).map_err(|e| {
             error!("update_account json error -> {:?}", e);
@@ -840,6 +952,16 @@ impl<'a> CacheTxn for DbTxn<'a> {
             )
             .map(|_| ())
             .map_err(|e| self.sqlite_error("account_t delete", &e))
+    }
+
+    fn clear_account_password(&mut self, a_uuid: Uuid) -> Result<(), CacheError> {
+        self.conn
+            .execute(
+                "UPDATE account_t SET password = NULL WHERE uuid = ?1",
+                [a_uuid.as_hyphenated().to_string()],
+            )
+            .map_err(|e| self.sqlite_error("clear account_t password", &e))
+            .map(|_| ())
     }
 
     fn update_account_password(
@@ -1087,10 +1209,57 @@ impl<'a> Drop for DbTxn<'a> {
     }
 }
 
+impl DbReadTxn<'_> {
+    pub fn get_account(&mut self, account_id: &Id) -> Result<Option<(UserToken, u64)>, CacheError> {
+        self.txn.get_account(account_id)
+    }
+
+    pub fn get_unexpired_accounts(&mut self, now: u64) -> Result<Vec<UserToken>, CacheError> {
+        self.txn.get_unexpired_accounts(now)
+    }
+
+    pub fn get_group(&mut self, grp_id: &Id) -> Result<Option<(GroupToken, u64)>, CacheError> {
+        self.txn.get_group(grp_id)
+    }
+
+    pub fn get_group_members(&mut self, g_uuid: Uuid) -> Result<Vec<UserToken>, CacheError> {
+        self.txn.get_group_members(g_uuid)
+    }
+
+    pub fn get_groups(&mut self) -> Result<Vec<GroupToken>, CacheError> {
+        self.txn.get_groups()
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct TestDbFile(pub(crate) String);
+
+#[cfg(test)]
+impl TestDbFile {
+    pub(crate) fn new() -> Self {
+        let path =
+            std::env::temp_dir().join(format!("himmelblau_db_test_{}.db", uuid::Uuid::new_v4()));
+        Self(
+            path.to_str()
+                .expect("Temporary test path is not valid UTF-8")
+                .to_string(),
+        )
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestDbFile {
+    fn drop(&mut self) {
+        for suffix in ["", "-journal", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{}", self.0, suffix));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
-    use super::{Cache, CacheTxn, Db, KeyStoreTxn};
+    use super::{Cache, CacheError, CacheTxn, Db, KeyStoreTxn, TestDbFile, DBV_MAIN};
     use crate::idprovider::interface::{GroupToken, Id, UserToken};
     use kanidm_hsm_crypto::{provider::BoxedDynTpm, provider::Tpm, AuthValue};
 
@@ -1110,8 +1279,218 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_hsm_machine_key_is_not_treated_as_missing() {
+        let db = Db::new("").expect("failed to create.");
+        let mut dbtxn = db.write().await;
+        assert!(dbtxn.migrate().is_ok());
+        assert!(dbtxn
+            .conn
+            .execute(
+                "INSERT INTO hsm_int_t (key, value) VALUES ('mk', ?1)",
+                [b"invalid".as_slice()],
+            )
+            .is_ok());
+
+        assert!(matches!(
+            dbtxn.get_hsm_machine_key(),
+            Err(CacheError::SerdeJson)
+        ));
+    }
+
+    #[tokio::test]
+    async fn uninitialized_database_has_no_hsm_machine_key() {
+        let db = Db::new("").expect("failed to create.");
+        assert!(matches!(db.get_loadable_hsm_key().await, Ok(None)));
+    }
+
+    fn test_account() -> UserToken {
+        UserToken {
+            name: "testuser".to_string(),
+            spn: "testuser@example.com".to_string(),
+            displayname: "Before".to_string(),
+            real_gidnumber: Some(2000),
+            gidnumber: 2000,
+            uuid: uuid::uuid!("0302b99c-f0f6-41ab-9492-852692b0fd16"),
+            shell: None,
+            groups: Vec::new(),
+            tenant_id: Some(uuid::uuid!("58e8a301-2502-4814-81c5-a4d17c399a45")),
+            valid: true,
+        }
+    }
+
+    async fn setup_file_db(file: &TestDbFile) -> Db {
+        let db = Db::new(&file.0).expect("failed to create.");
+        let mut dbtxn = db.write().await;
+        dbtxn.migrate().unwrap();
+        dbtxn.update_account(&test_account(), 300).unwrap();
+        dbtxn.commit().unwrap();
+        db
+    }
+
+    #[tokio::test]
+    async fn read_does_not_wait_for_a_write_larger_than_the_page_cache() {
+        let file = TestDbFile::new();
+        let db = setup_file_db(&file).await;
+
+        let dbtxn = db.write().await;
+        dbtxn
+            .conn
+            .execute_batch("PRAGMA cache_size = 5; CREATE TABLE filler (data BLOB)")
+            .unwrap();
+        for _ in 0..400 {
+            dbtxn
+                .conn
+                .execute("INSERT INTO filler VALUES (randomblob(4000))", [])
+                .unwrap();
+        }
+
+        let id = Id::Name(test_account().spn);
+        assert!(db.read().await.get_account(&id).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn read_gives_up_quickly_while_another_connection_holds_the_lock() {
+        let file = TestDbFile::new();
+        let db = setup_file_db(&file).await;
+        let other = rusqlite::Connection::open(&file.0).unwrap();
+        other.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+        let started = std::time::Instant::now();
+        let id = Id::Name(test_account().spn);
+        assert!(db.read().await.get_account(&id).is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+
+        other.execute_batch("ROLLBACK").unwrap();
+        assert!(db.read().await.get_account(&id).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn read_does_not_wait_for_an_open_write_transaction() {
+        let file = TestDbFile::new();
+        let db = setup_file_db(&file).await;
+        let mut account = test_account();
+        account.displayname = "After".to_string();
+        let mut dbtxn = db.write().await;
+        dbtxn.update_account(&account, 300).unwrap();
+
+        let id = Id::Name(account.spn.clone());
+        let mut reader = tokio::time::timeout(std::time::Duration::from_secs(5), db.read())
+            .await
+            .expect("lookup waited for the write transaction");
+        let (cached, _) = reader.get_account(&id).unwrap().unwrap();
+        assert_eq!(cached.displayname, "Before");
+        drop(reader);
+
+        dbtxn.commit().unwrap();
+        let (cached, _) = db.read().await.get_account(&id).unwrap().unwrap();
+        assert_eq!(cached.displayname, "After");
+    }
+
+    #[tokio::test]
+    async fn test_cache_db_migrate_invalidates_legacy_account_expiry_once() {
+        let db = Db::new("").expect("failed to create.");
+        let mut dbtxn = db.write().await;
+        dbtxn.migrate().unwrap();
+
+        // Version 1 has the same tables, but lookup-only accounts were cached
+        // with future expiries even when they had never authenticated.
+        dbtxn.set_db_version(DBV_MAIN, 1).unwrap();
+        let group = GroupToken {
+            name: "testgroup".to_string(),
+            spn: "testgroup@example.com".to_string(),
+            gidnumber: 2001,
+            uuid: uuid::uuid!("b500be97-8552-42a5-aca0-668bc5625705"),
+        };
+        let lookup_only = UserToken {
+            name: "testuser".to_string(),
+            spn: "testuser@example.com".to_string(),
+            displayname: "Test User".to_string(),
+            real_gidnumber: Some(2000),
+            gidnumber: 2000,
+            uuid: uuid::uuid!("0302b99c-f0f6-41ab-9492-852692b0fd16"),
+            shell: None,
+            groups: vec![group.clone()],
+            tenant_id: Some(uuid::uuid!("58e8a301-2502-4814-81c5-a4d17c399a45")),
+            valid: true,
+        };
+        let authenticated = UserToken {
+            name: "authenticated".to_string(),
+            spn: "authenticated@example.com".to_string(),
+            gidnumber: 2002,
+            uuid: uuid::uuid!("bcb7ca11-7049-4588-a761-aeacbeecffa8"),
+            ..lookup_only.clone()
+        };
+        dbtxn.update_group(&group, 200).unwrap();
+        dbtxn.update_account(&lookup_only, 200).unwrap();
+        dbtxn.update_account(&authenticated, 200).unwrap();
+        let password = b"existing password verifier".to_vec();
+        dbtxn
+            .conn
+            .execute(
+                "UPDATE account_t SET password = ?1 WHERE name = ?2",
+                params![&password, &authenticated.name],
+            )
+            .unwrap();
+        let key_tag = "authenticated@example.com/hello";
+        let key_data = "existing sealed credential".to_string();
+        dbtxn.insert_tagged_hsm_key(key_tag, &key_data).unwrap();
+        assert_eq!(dbtxn.get_unexpired_accounts(100).unwrap().len(), 2);
+        dbtxn.commit().unwrap();
+
+        let mut dbtxn = db.write().await;
+        dbtxn.migrate().unwrap();
+        assert_eq!(dbtxn.get_db_version(DBV_MAIN), 2);
+        assert!(dbtxn.get_unexpired_accounts(100).unwrap().is_empty());
+        for account in [&lookup_only, &authenticated] {
+            let (stored, expiry) = dbtxn
+                .get_account(&Id::Name(account.spn.clone()))
+                .unwrap()
+                .unwrap();
+            assert_eq!(expiry, 0);
+            assert_eq!(
+                serde_json::to_vec(&stored).unwrap(),
+                serde_json::to_vec(account).unwrap()
+            );
+        }
+        let stored_password: Vec<u8> = dbtxn
+            .conn
+            .query_row(
+                "SELECT password FROM account_t WHERE name = ?1",
+                [&authenticated.name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_password, password);
+        assert_eq!(
+            dbtxn.get_tagged_hsm_key::<String>(key_tag).unwrap(),
+            Some(key_data)
+        );
+        assert_eq!(dbtxn.get_group_members(group.uuid).unwrap().len(), 2);
+        assert_eq!(
+            dbtxn
+                .get_group(&Id::Name(group.spn.clone()))
+                .unwrap()
+                .unwrap()
+                .1,
+            200
+        );
+        dbtxn.commit().unwrap();
+
+        // A subsequent authenticated refresh must survive future startups;
+        // the untouched legacy lookup-only row must remain expired.
+        let mut dbtxn = db.write().await;
+        dbtxn.update_account(&authenticated, 300).unwrap();
+        dbtxn.commit().unwrap();
+        let mut dbtxn = db.write().await;
+        dbtxn.migrate().unwrap();
+        let accounts = dbtxn.get_unexpired_accounts(100).unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].uuid, authenticated.uuid);
+        dbtxn.commit().unwrap();
+    }
+
+    #[tokio::test]
     async fn test_clear_hello_keys() {
-        sketching::test_init();
         let db = Db::new("").expect("failed to create.");
         let mut dbtxn = db.write().await;
         assert!(dbtxn.migrate().is_ok());
@@ -1146,7 +1525,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_db_account_basic() {
-        sketching::test_init();
         let db = Db::new("").expect("failed to create.");
         let mut dbtxn = db.write().await;
         assert!(dbtxn.migrate().is_ok());
@@ -1231,7 +1609,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_db_group_basic() {
-        sketching::test_init();
         let db = Db::new("").expect("failed to create.");
         let mut dbtxn = db.write().await;
         assert!(dbtxn.migrate().is_ok());
@@ -1306,7 +1683,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_db_account_group_update() {
-        sketching::test_init();
         let db = Db::new("").expect("failed to create.");
         let mut dbtxn = db.write().await;
         assert!(dbtxn.migrate().is_ok());
@@ -1375,8 +1751,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_db_account_password() {
-        sketching::test_init();
-
         let db = Db::new("").expect("failed to create.");
 
         let mut dbtxn = db.write().await;
@@ -1462,7 +1836,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_db_group_rename_duplicate() {
-        sketching::test_init();
         let db = Db::new("").expect("failed to create.");
         let mut dbtxn = db.write().await;
         assert!(dbtxn.migrate().is_ok());
@@ -1517,7 +1890,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_db_account_rename_duplicate() {
-        sketching::test_init();
         let db = Db::new("").expect("failed to create.");
         let mut dbtxn = db.write().await;
         assert!(dbtxn.migrate().is_ok());

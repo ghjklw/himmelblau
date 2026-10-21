@@ -25,7 +25,7 @@ use std::fs::metadata;
 use std::io;
 use std::io::Error as IoError;
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::io::FromRawFd;
+use std::os::unix::io::{FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -43,7 +43,7 @@ use himmelblau_unix_common::constants::{
 use himmelblau_unix_common::db::{Cache, CacheTxn, Db};
 use himmelblau_unix_common::idprovider::himmelblau::HimmelblauMultiProvider;
 use himmelblau_unix_common::idprovider::interface::{Id, IdProvider};
-use himmelblau_unix_common::resolver::{AuthSession, Resolver};
+use himmelblau_unix_common::resolver::{AuthSession, OnExpiry, Resolver};
 use himmelblau_unix_common::unix_config::UidAttr;
 use himmelblau_unix_common::unix_passwd::{parse_etc_group, parse_etc_passwd};
 use himmelblau_unix_common::unix_proto::{
@@ -55,7 +55,7 @@ use idmap::{gen_subid_start, SUBID_COUNT};
 use uuid::Uuid;
 
 use kanidm_utils_users::{get_current_gid, get_current_uid, get_effective_gid, get_effective_uid};
-use libc::umask;
+use libc::{close, umask};
 use sd_notify::NotifyState;
 use sketching::tracing_forest::traits::*;
 use sketching::tracing_forest::util::*;
@@ -71,11 +71,12 @@ use tokio::time;
 use tokio_util::codec::{Decoder, Encoder, Framed};
 use tracing::span;
 
-use kanidm_hsm_crypto::{provider::BoxedDynTpm, provider::SoftTpm, provider::Tpm};
+use kanidm_hsm_crypto::provider::Tpm;
 
 use notify_debouncer_full::{new_debouncer, notify::RecursiveMode};
 
 mod broker;
+mod logging;
 use broker::Broker;
 use identity_dbus_broker::himmelblau_broker_serve_with_listener;
 
@@ -87,6 +88,10 @@ mod prt_memfd;
 enum TaskOutcome {
     Status(i32),
     NonCompliant(Vec<NoncompliantRule>),
+}
+
+fn profile_photo_task_succeeded(outcome: &TaskOutcome) -> bool {
+    matches!(outcome, TaskOutcome::Status(0))
 }
 
 type AsyncTaskRequest = (TaskRequest, oneshot::Sender<TaskOutcome>);
@@ -169,6 +174,47 @@ impl Encoder<TaskRequest> for TaskCodec {
         })?;
         dst.put(data.as_slice());
         Ok(())
+    }
+}
+
+/// ListenStream paths in platform/systemd. The config defaults use /var/run,
+/// which is the same directory as /run.
+const ACTIVATED_MAIN_SOCKET: &str = "/run/himmelblaud/socket";
+const ACTIVATED_TASK_SOCKET: &str = "/run/himmelblaud/task_sock";
+const ACTIVATED_BROKER_SOCKET: &str = "/run/himmelblaud/broker_sock";
+
+fn normalize_socket_path(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    if let Some(rest) = trimmed.strip_prefix("/var/run/") {
+        format!("/run/{rest}")
+    } else if trimmed == "/var/run" {
+        "/run".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn socket_paths_equivalent(configured: &str, activated: &str) -> bool {
+    normalize_socket_path(configured) == normalize_socket_path(activated)
+}
+
+/// Drop a socket-activated fd when himmelblau.conf names a different path.
+/// PAM, NSS, and the CLI connect to the configured path, not the unit path.
+fn release_activated_socket_unless_configured(
+    activated: &mut Option<RawFd>,
+    configured: &str,
+    unit_path: &str,
+) {
+    if socket_paths_equivalent(configured, unit_path) {
+        return;
+    }
+    if let Some(fd) = activated.take() {
+        debug!(
+            configured,
+            unit_path, "socket path is not the systemd unit path; binding the configured path"
+        );
+        // SAFETY: this fd was passed in by systemd and is owned by this process.
+        let _ = unsafe { close(fd) };
     }
 }
 
@@ -287,6 +333,27 @@ async fn is_account_sudoer(
     false
 }
 
+fn authenticated_name_mapping_request(
+    supplied: Option<&str>,
+    authenticated_upn: &str,
+    response: &PamAuthResponse,
+    enabled: bool,
+) -> Option<TaskRequest> {
+    let supplied = supplied?;
+    if enabled
+        && matches!(response, PamAuthResponse::Success)
+        && split_username(supplied).is_some()
+        && supplied.eq_ignore_ascii_case(authenticated_upn)
+    {
+        Some(TaskRequest::LearnNameMapping(
+            supplied.to_string(),
+            authenticated_upn.to_string(),
+        ))
+    } else {
+        None
+    }
+}
+
 async fn submit_local_groups_task(
     task_channel_tx: &Sender<AsyncTaskRequest>,
     account_id: String,
@@ -330,9 +397,9 @@ async fn reconcile_local_groups_once(
         })
         .collect();
 
-    let accounts = match cachelayer.get_nssaccounts().await {
+    let accounts = match cachelayer.get_unexpired_nssaccounts().await {
         Ok(accounts) => accounts,
-        Err(()) => {
+        Err(_) => {
             warn!("Unable to fetch cached users for local group reconciliation");
             return;
         }
@@ -351,7 +418,7 @@ async fn reconcile_local_groups_once(
                     );
                     continue;
                 }
-                Err(()) => {
+                Err(_) => {
                     warn!(
                         account_id = account.name.as_str(),
                         "Failed to refresh cached user before local group reconciliation"
@@ -424,6 +491,7 @@ async fn handle_client(
 
     let mut reqs = Framed::new(sock, ClientCodec);
     let mut pam_auth_session_state = None;
+    let mut pam_supplied_name: Option<String> = None;
 
     // Setup a broadcast channel so that if we have an unexpected disconnection, we can
     // tell consumers to stop work.
@@ -431,6 +499,19 @@ async fn handle_client(
 
     trace!("Waiting for requests ...");
     while let Some(Ok(req)) = reqs.next().await {
+        let (req, supplied_name) = match req {
+            ClientRequest::PamAuthenticateInitWithName(
+                id,
+                service,
+                no_hello_pin,
+                force_reauth,
+                supplied,
+            ) => (
+                ClientRequest::PamAuthenticateInit(id, service, no_hello_pin, force_reauth),
+                Some(supplied),
+            ),
+            request => (request, None),
+        };
         let resp = match req {
             ClientRequest::NssAccounts => {
                 trace!("nssaccounts req");
@@ -446,7 +527,7 @@ async fn handle_client(
             ClientRequest::NssAccountByUid(gid) => {
                 trace!("nssaccountbyuid req");
                 cachelayer
-                    .get_nssaccount_gid(gid)
+                    .get_nssaccount_gid(gid, OnExpiry::RefreshInBackground)
                     .await
                     .map(ClientResponse::NssAccount)
                     .unwrap_or_else(|_| {
@@ -458,7 +539,7 @@ async fn handle_client(
                 let account_id = account_id.to_lowercase();
                 trace!("nssaccountbyname req");
                 cachelayer
-                    .get_nssaccount_name(account_id.as_str())
+                    .get_nssaccount_name(account_id.as_str(), OnExpiry::RefreshInBackground)
                     .await
                     .map(ClientResponse::NssAccount)
                     .unwrap_or_else(|_| {
@@ -503,7 +584,7 @@ async fn handle_client(
                 let account_id = account_id.to_lowercase();
                 trace!("nssinitgroups req");
                 cachelayer
-                    .get_initgroups(account_id.as_str())
+                    .get_initgroups(account_id.as_str(), OnExpiry::RefreshIfReachable)
                     .await
                     .map(ClientResponse::NssInitgroups)
                     .unwrap_or_else(|_| {
@@ -511,7 +592,12 @@ async fn handle_client(
                         ClientResponse::Error
                     })
             }
+            ClientRequest::PamAuthenticateInitWithName(..) => {
+                error!("Named authentication request was not normalized");
+                ClientResponse::Error
+            }
             ClientRequest::PamAuthenticateInit(account_id, service, no_hello_pin, force_reauth) => {
+                pam_supplied_name = supplied_name;
                 let account_id = account_id.to_lowercase();
                 let span = span!(Level::INFO, "pam authenticate init");
                 trace!("pam authenticate init");
@@ -755,55 +841,11 @@ async fn handle_client(
                                                     if cfg.get_fetch_profile_picture()
                                                         && !is_oidc_auth
                                                     {
-                                                        if let Some(token) = cachelayer
-                                                            .get_user_accesstoken(
-                                                                Id::Name(account_id.to_string()),
-                                                                vec![],
-                                                                None,
-                                                                None,
-                                                                None,
-                                                            )
-                                                            .await
-                                                        {
-                                                            if let Some(access_token) = &token.access_token {
-                                                                let (tx, rx) = oneshot::channel();
-
-                                                                match task_channel_tx
-                                                                    .send_timeout(
-                                                                        (
-                                                                            TaskRequest::LoadProfilePhoto(
-                                                                                account_id.to_string(),
-                                                                                access_token.to_string(),
-                                                                            ),
-                                                                            tx,
-                                                                        ),
-                                                                        Duration::from_millis(100),
-                                                                    )
-                                                                    .await
-                                                                {
-                                                                    Ok(()) => {
-                                                                        // Now wait for the other end OR timeout.
-                                                                        match time::timeout_at(
-                                                                            time::Instant::now()
-                                                                                + Duration::from_secs(60),
-                                                                            rx,
-                                                                        )
-                                                                        .await
-                                                                        {
-                                                                            Ok(_) => {
-                                                                                info!("Fetching user profile picture succeeded");
-                                                                            }
-                                                                            _ => {
-                                                                                error!("Fetching user profile picture failed");
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                    Err(_) => {
-                                                                        error!("Fetching user profile picture failed");
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
+                                                        spawn_profile_photo_fetch(
+                                                            cachelayer.clone(),
+                                                            task_channel_tx.clone(),
+                                                            account_id.clone(),
+                                                        );
                                                     }
 
                                                     // Apply Intune policies
@@ -816,6 +858,28 @@ async fn handle_client(
                                                             account_id.clone(),
                                                         )
                                                         .await;
+                                                    }
+
+                                                    if let Some(task) = authenticated_name_mapping_request(
+                                                        pam_supplied_name.take().as_deref(),
+                                                        &account_id,
+                                                        &resp,
+                                                        cfg.learned_name_mapping_enabled(),
+                                                    ) {
+                                                        let (tx, rx) = oneshot::channel();
+                                                        if task_channel_tx
+                                                            .send_timeout((task, tx), Duration::from_secs(1))
+                                                            .await
+                                                            .is_err()
+                                                        {
+                                                            warn!("Unable to queue authenticated name mapping");
+                                                        } else {
+                                                            match time::timeout(Duration::from_secs(5), rx).await {
+                                                                Ok(Ok(TaskOutcome::Status(0))) => debug!("Persisted authenticated name mapping"),
+                                                                Ok(Ok(TaskOutcome::Status(2))) => debug!("Name mapping skipped or already learned"),
+                                                                _ => warn!("Authenticated name mapping was not confirmed persisted"),
+                                                            }
+                                                        }
                                                     }
 
                                                     ClientResponse::PamAuthenticateStepResponse(resp)
@@ -987,7 +1051,7 @@ async fn handle_client(
                         None // not consulted; root is always authorized
                     } else {
                         cachelayer
-                            .get_nssaccount_name(&account_id)
+                            .get_nssaccount_name(&account_id, OnExpiry::Refresh)
                             .await
                             .ok()
                             .flatten()
@@ -1079,7 +1143,10 @@ async fn handle_client(
                     // NOTE: this intentionally uses `get_nssaccount_gid()` even though
                     // `ucred.uid()` is a UID. In the current NSS mapping, the resolver
                     // looks up the account via `gidnumber`, which is used as the NSS uid.
-                    let account_id = match cachelayer.get_nssaccount_gid(ucred.uid()).await {
+                    let account_id = match cachelayer
+                        .get_nssaccount_gid(ucred.uid(), OnExpiry::Refresh)
+                        .await
+                    {
                         Ok(Some(nss_user)) => nss_user.name,
                         _ => {
                             error!(
@@ -1171,7 +1238,7 @@ async fn handle_client(
                         Ok(false) => {
                             debug!("pam_try_unseal: failed for {}", account_id);
                         }
-                        Err(()) => {
+                        Err(_) => {
                             error!("pam_try_unseal: error for {}", account_id);
                         }
                     }
@@ -1297,6 +1364,59 @@ async fn spawn_intune_policy_application_if_due(
         intune_policy_throttle,
         account_id,
     );
+}
+
+fn spawn_profile_photo_fetch(
+    cachelayer: Arc<Resolver<HimmelblauMultiProvider>>,
+    task_channel_tx: Sender<AsyncTaskRequest>,
+    account_id: String,
+) {
+    tokio::spawn(async move {
+        let Some(token) = cachelayer
+            .get_user_accesstoken(Id::Name(account_id.clone()), vec![], None, None, None)
+            .await
+        else {
+            return;
+        };
+        let Some(access_token) = token.access_token.as_ref() else {
+            return;
+        };
+        let (tx, rx) = oneshot::channel();
+        if task_channel_tx
+            .send_timeout(
+                (
+                    TaskRequest::LoadProfilePhoto(account_id, access_token.to_string()),
+                    tx,
+                ),
+                Duration::from_millis(100),
+            )
+            .await
+            .is_err()
+        {
+            error!("Fetching user profile picture failed");
+            return;
+        }
+        match time::timeout_at(time::Instant::now() + Duration::from_secs(60), rx).await {
+            Ok(Ok(outcome)) if profile_photo_task_succeeded(&outcome) => {
+                debug!("Profile photo fetch accepted by the tasks daemon");
+            }
+            Ok(Ok(TaskOutcome::Status(status))) => {
+                error!(
+                    "Fetching user profile picture failed: status code {}",
+                    status
+                );
+            }
+            Ok(Ok(TaskOutcome::NonCompliant(_))) => {
+                error!("Fetching user profile picture: unexpected NonCompliant task outcome");
+            }
+            Ok(Err(e)) => {
+                error!("Fetching user profile picture failed: {:?}", e);
+            }
+            Err(e) => {
+                error!("Fetching user profile picture failed: {:?}", e);
+            }
+        }
+    });
 }
 
 fn spawn_intune_policy_application(
@@ -1439,11 +1559,93 @@ async fn apply_intune_policy_for_account(
     }
 }
 
+// Keep this long-standing test module in place to avoid unrelated churn in
+// stable backports when production helpers are added below it.
+#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const ACCOUNT_ID: &str = "user@example.com";
+
+    #[test]
+    fn learned_name_task_requires_daemon_verified_success_and_exact_upn() {
+        let success = PamAuthResponse::Success;
+        assert!(authenticated_name_mapping_request(
+            Some("alice@example.com"),
+            "alice@example.com",
+            &success,
+            true
+        )
+        .is_some());
+        assert!(authenticated_name_mapping_request(
+            Some("Alice@Example.com"),
+            "alice@example.com",
+            &success,
+            true
+        )
+        .is_some());
+        assert!(authenticated_name_mapping_request(
+            Some("alice"),
+            "alice@example.com",
+            &success,
+            true
+        )
+        .is_none());
+        assert!(authenticated_name_mapping_request(
+            Some("other@example.com"),
+            "alice@example.com",
+            &success,
+            true
+        )
+        .is_none());
+        assert!(
+            authenticated_name_mapping_request(None, "alice@example.com", &success, true).is_none()
+        );
+        assert!(authenticated_name_mapping_request(
+            Some("alice@example.com"),
+            "alice@example.com",
+            &success,
+            false
+        )
+        .is_none());
+        assert!(authenticated_name_mapping_request(
+            Some("alice@example.com"),
+            "alice@example.com",
+            &PamAuthResponse::Denied("denied".to_string()),
+            true
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn default_socket_paths_match_the_systemd_units() {
+        assert!(socket_paths_equivalent(
+            "/var/run/himmelblaud/socket",
+            ACTIVATED_MAIN_SOCKET
+        ));
+        assert!(socket_paths_equivalent(
+            "/run/himmelblaud/task_sock/",
+            ACTIVATED_TASK_SOCKET
+        ));
+        assert!(socket_paths_equivalent(
+            "/var/run/himmelblaud/broker_sock",
+            ACTIVATED_BROKER_SOCKET
+        ));
+        assert!(!socket_paths_equivalent(
+            "/tmp/himmelblaud.sock",
+            ACTIVATED_MAIN_SOCKET
+        ));
+    }
+
+    #[test]
+    fn profile_photo_success_requires_zero_status() {
+        assert!(profile_photo_task_succeeded(&TaskOutcome::Status(0)));
+        assert!(!profile_photo_task_succeeded(&TaskOutcome::Status(1)));
+        assert!(!profile_photo_task_succeeded(&TaskOutcome::NonCompliant(
+            Vec::new()
+        )));
+    }
 
     #[test]
     fn intune_policy_throttle_allows_first_run_and_marks_in_flight() {
@@ -1639,6 +1841,12 @@ mod tests {
     }
 }
 
+fn notify_noop_reload() -> io::Result<()> {
+    let monotonic_usec = NotifyState::monotonic_usec_now()?;
+    sd_notify::notify(&[NotifyState::Reloading, monotonic_usec])?;
+    sd_notify::notify(&[NotifyState::Ready])
+}
+
 async fn process_etc_passwd_group(
     cachelayer: &Resolver<HimmelblauMultiProvider>,
 ) -> Result<(), Box<dyn Error>> {
@@ -1745,6 +1953,7 @@ async fn main() -> ExitCode {
                .with(console_layer);
 
             subscriber
+            .with(sketching::tracing_subscriber::filter::filter_fn(logging::auth_log_enabled))
             .with(EnvFilter::try_from_default_env()
                 .or_else(|_| EnvFilter::try_new("info"))
                 .expect("Failed to init envfilter")
@@ -1831,6 +2040,21 @@ async fn main() -> ExitCode {
             // activation + FD store) in one shot, before anything
             // else consumes the LISTEN_* environment variables.
             let mut systemd_fds = prt_memfd::collect_systemd_fds();
+            release_activated_socket_unless_configured(
+                &mut systemd_fds.main_socket,
+                &socket_path,
+                ACTIVATED_MAIN_SOCKET,
+            );
+            release_activated_socket_unless_configured(
+                &mut systemd_fds.task_socket,
+                &task_socket_path,
+                ACTIVATED_TASK_SOCKET,
+            );
+            release_activated_socket_unless_configured(
+                &mut systemd_fds.broker_socket,
+                &broker_socket_path,
+                ACTIVATED_BROKER_SOCKET,
+            );
 
             // Only clean up sockets that were NOT passed via socket
             // activation, as those are owned by systemd.
@@ -1948,9 +2172,16 @@ async fn main() -> ExitCode {
                     return ExitCode::FAILURE
                 }
 
-            let (auth_value, mut hsm) = tpm_init!(cfg, return ExitCode::FAILURE);
 
-            // With the assistance of the DB, setup the HSM and its machine key.
+            // With the assistance of the DB, setup the HSM and its machine key,
+            // first checking for an existing key and then generating a new one
+            // if necessary.
+
+            let (auth_value, mut hsm) = tpm_init!(
+                cfg,
+                db.get_loadable_hsm_key(),
+                return ExitCode::FAILURE
+            );
 
             let loadable_machine_key = tpm_loadable_machine_key!(
                 db,
@@ -2018,6 +2249,7 @@ async fn main() -> ExitCode {
                 cfg.get_home_alias(None),
                 UidAttr::Name,
                 UidAttr::Name,
+                cfg.get_initgroups_mode(),
                 user_map.get_id_overrides(),
             )
             .await
@@ -2075,6 +2307,7 @@ async fn main() -> ExitCode {
             let mut c_broadcast_rx = broadcast_tx.subscribe();
             let mut d_broadcast_rx = broadcast_tx.subscribe();
             let local_groups_broadcast_rx = broadcast_tx.subscribe();
+            let identity_refresh_broadcast_rx = broadcast_tx.subscribe();
 
             let local_groups_cachelayer = cachelayer.clone();
             let local_groups_task_channel_tx = task_channel_tx.clone();
@@ -2087,6 +2320,13 @@ async fn main() -> ExitCode {
                     local_groups_broadcast_rx,
                 )
                 .await;
+            });
+
+            let identity_refresh_cachelayer = cachelayer.clone();
+            let identity_refresher = tokio::spawn(async move {
+                identity_refresh_cachelayer
+                    .refresh_expired_identities(identity_refresh_broadcast_rx)
+                    .await;
             });
 
             let task_b = tokio::spawn(async move {
@@ -2287,6 +2527,17 @@ async fn main() -> ExitCode {
                 info!("Stopped resolver");
             });
 
+            // systemd checks for the reload signal handler when it receives READY=1.
+            let mut sighup = match tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::hangup(),
+            ) {
+                Ok(signal) => signal,
+                Err(e) => {
+                    error!("Failed to register SIGHUP handler: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+
             info!("Server started ...");
 
             if systemd_booted {
@@ -2324,12 +2575,12 @@ async fn main() -> ExitCode {
                     } => {
                         // Ignore
                     }
-                    Some(()) = async move {
-                        let sigterm = tokio::signal::unix::SignalKind::hangup();
-                        #[allow(clippy::unwrap_used)]
-                        tokio::signal::unix::signal(sigterm).unwrap().recv().await
-                    } => {
-                        // Ignore
+                    Some(()) = sighup.recv() => {
+                        if systemd_booted {
+                            if let Err(e) = notify_noop_reload() {
+                                error!("Failed to acknowledge systemd reload: {}", e);
+                            }
+                        }
                     }
                     Some(()) = async move {
                         let sigterm = tokio::signal::unix::SignalKind::user_defined1();
@@ -2397,6 +2648,7 @@ async fn main() -> ExitCode {
             let _ = task_a.await;
             let _ = task_b.await;
             let _ = local_groups_reconciler.await;
+            let _ = identity_refresher.await;
             let _ = task_c.await;
             let _ = task_d.await;
 
